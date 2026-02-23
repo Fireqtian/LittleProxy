@@ -1,0 +1,11 @@
+{
+  "default_target_host": "your-api-host.example.com",
+  "model_mapping": {
+    "your_model_alias": {
+      "url": "https://your-api-host.example.com",
+      "key": "your-api-key-here",
+      "model": "model-identifier",
+      "description": "模型描述"
+    }
+  }
+}
