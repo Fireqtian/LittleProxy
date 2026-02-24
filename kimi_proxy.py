@@ -18,13 +18,11 @@ PORT = 8112
 DEFAULT_TARGET_HOST = None  # 将从配置文件加载
 DEFAULT_TARGET_BASE_URL = None  # 将从配置文件加载
 
-# 请求日志记录配置
-ENABLE_REQUEST_LOGGING = True  # 是否启用请求日志记录
-REQUEST_LOG_DIR = "request_logs"  # 保存请求日志的文件夹路径
-
-# 响应日志记录配置
-ENABLE_RESPONSE_LOGGING = True  # 是否启用响应日志记录
-RESPONSE_LOG_DIR = "response_logs"  # 保存响应日志的文件夹路径
+# 日志配置（从配置文件加载）
+ENABLE_REQUEST_LOGGING = True
+REQUEST_LOG_DIR = "request_logs"
+ENABLE_RESPONSE_LOGGING = True
+RESPONSE_LOG_DIR = "response_logs"
 
 # Kimi 特殊格式标记
 KIMI_MARKERS = {
@@ -636,8 +634,22 @@ app = FastAPI()
 
 # 加载模型映射配置
 def load_config():
-    """加载配置文件，返回 (model_mapping, default_target_host)"""
+    """
+    加载配置文件，返回配置元组
+    返回: (model_mapping, default_target_host, logging_config)
+    logging_config: dict with keys: enable_request_logging, enable_response_logging,
+                    request_log_dir, response_log_dir
+    """
     config_path = os.path.join(os.path.dirname(__file__), "model_mapping.json")
+    
+    # 默认日志配置
+    default_logging = {
+        "enable_request_logging": True,
+        "enable_response_logging": True,
+        "request_log_dir": "request_logs",
+        "response_log_dir": "response_logs"
+    }
+    
     try:
         with open(config_path, "r", encoding="utf-8") as f:
             config = json.load(f)
@@ -648,19 +660,34 @@ def load_config():
                 # 新格式
                 model_mapping = config.get("model_mapping", {})
                 default_host = config.get("default_target_host", "api.openai.com")
+                logging_config = config.get("logging", default_logging)
             else:
                 # 旧格式（直接是模型映射）
                 model_mapping = config
                 default_host = "api.openai.com"
-            return model_mapping, default_host
+                logging_config = default_logging
+            
+            # 合并默认日志配置（确保所有字段都存在）
+            for key, value in default_logging.items():
+                if key not in logging_config:
+                    logging_config[key] = value
+            
+            return model_mapping, default_host, logging_config
         else:
-            return {}, "api.openai.com"
+            return {}, "api.openai.com", default_logging
     except (FileNotFoundError, json.JSONDecodeError) as e:
         print(f"[Warning] model_mapping.json error: {e}")
-        return {}, "api.openai.com"
+        return {}, "api.openai.com", default_logging
 
-MODEL_MAPPING, DEFAULT_TARGET_HOST = load_config()
+# 加载配置并设置全局变量
+MODEL_MAPPING, DEFAULT_TARGET_HOST, LOGGING_CONFIG = load_config()
 DEFAULT_TARGET_BASE_URL = f"https://{DEFAULT_TARGET_HOST}"
+
+# 设置日志配置全局变量
+ENABLE_REQUEST_LOGGING = LOGGING_CONFIG.get("enable_request_logging", True)
+REQUEST_LOG_DIR = LOGGING_CONFIG.get("request_log_dir", "request_logs")
+ENABLE_RESPONSE_LOGGING = LOGGING_CONFIG.get("enable_response_logging", True)
+RESPONSE_LOG_DIR = LOGGING_CONFIG.get("response_log_dir", "response_logs")
 
 client_cache = {}
 
@@ -681,6 +708,15 @@ async def catch_all_proxy(request: Request, path: str, background_tasks: Backgro
 async def handle_chat_completions(request: Request, path: str, background_tasks: BackgroundTasks):
     body = await request.json()
     background_tasks.add_task(save_request_log, body, path)
+    
+    # 添加 enable_thinking 参数（如果原来没有）
+    if "enable_thinking" not in body:
+        body["enable_thinking"] = True
+
+    # 【关键修复】提取非标准参数，避免传递给 OpenAI SDK 时出错
+    extra_body = {}
+    if "enable_thinking" in body:
+        extra_body["enable_thinking"] = body.pop("enable_thinking")
     
     original_model = body.get("model", "")
     is_stream = body.get("stream", False)  # 获取请求是否为流式（OpenAI规范的默认值是False）
@@ -710,7 +746,11 @@ async def handle_chat_completions(request: Request, path: str, background_tasks:
     
     client = get_or_create_client(target_url, target_key)
     # 移除 extra_headers，因为 client 已包含 Authorization
-    response = await client.chat.completions.create(**body)
+    # 【关键修复】通过 extra_body 传递 enable_thinking
+    response = await client.chat.completions.create(
+        **body, 
+        extra_body=extra_body if extra_body else None
+    )
     
     # 非流式响应处理
     if not is_stream:

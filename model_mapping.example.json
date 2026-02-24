@@ -1,5 +1,11 @@
 {
   "default_target_host": "your-api-host.example.com",
+  "logging": {
+    "enable_request_logging": true,
+    "enable_response_logging": true,
+    "request_log_dir": "request_logs",
+    "response_log_dir": "response_logs"
+  },
   "model_mapping": {
     "your_model_alias": {
       "url": "https://your-api-host.example.com",

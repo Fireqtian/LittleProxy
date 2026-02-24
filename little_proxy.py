@@ -27,9 +27,11 @@ MAX_BUFFER_SIZE = 128  # 用于跨 chunk 检测的缓冲区最大大小
 # 不可或缺的 native tools_call 配置
 REQUIRE_NATIVE_TOOL_CALL = False  # 当启用时，请求的回答必须包含 tool call，否则返回异常
 
-# 请求日志记录配置
-ENABLE_REQUEST_LOGGING = True  # 是否启用请求日志记录
-REQUEST_LOG_DIR = "request_logs"  # 保存请求日志的文件夹路径
+# 日志配置（从配置文件加载）
+ENABLE_REQUEST_LOGGING = True
+REQUEST_LOG_DIR = "request_logs"
+ENABLE_RESPONSE_LOGGING = True
+RESPONSE_LOG_DIR = "response_logs"
 
 
 # 自定义异常：用于标记拦截行为
@@ -72,6 +74,46 @@ def save_request_log(body: any, path: str):
         print(f"[Request Log] Saved to {filepath}")
     except Exception as e:
         print(f"[Request Log Error] Failed to save request log: {e}")
+
+
+def save_response_log(response_data: any, path: str, is_stream: bool = False):
+    """
+    后台任务：保存响应日志到JSON文件
+    - response_data: 响应内容（可以是 dict 或 list）
+    - path: 请求路径
+    - is_stream: 是否为流式响应
+    """
+    if not ENABLE_RESPONSE_LOGGING:
+        return
+    
+    try:
+        # 确保日志目录存在
+        log_dir = os.path.join(os.path.dirname(__file__), RESPONSE_LOG_DIR)
+        if not os.path.exists(log_dir):
+            os.makedirs(log_dir)
+        
+        # 生成时间戳文件名（包含微秒以确保唯一性）
+        timestamp = time.strftime("%Y%m%d_%H%M%S")
+        microseconds = str(time.time()).split('.')[-1][:6]  # 获取微秒部分
+        stream_suffix = "_stream" if is_stream else ""
+        filename = f"{timestamp}_{microseconds}_{path.replace('/', '_').replace(':', '_')}{stream_suffix}.json"
+        filepath = os.path.join(log_dir, filename)
+        
+        # 准备要记录的日志数据
+        log_data = {
+            "timestamp": time.strftime("%Y-%m-%d %H:%M:%S"),
+            "path": path,
+            "is_stream": is_stream,
+            "response_body": response_data
+        }
+        
+        # 将响应写入文件
+        with open(filepath, "w", encoding="utf-8") as f:
+            json.dump(log_data, f, ensure_ascii=False, indent=2)
+        
+        print(f"[Response Log] Saved to {filepath}")
+    except Exception as e:
+        print(f"[Response Log Error] Failed to save response log: {e}")
 
 
 def setup_logging():
@@ -278,8 +320,22 @@ from fastapi import HTTPException
 
 # 加载模型映射配置
 def load_config():
-    """加载配置文件，返回 (model_mapping, default_target_host)"""
+    """
+    加载配置文件，返回配置元组
+    返回: (model_mapping, default_target_host, logging_config)
+    logging_config: dict with keys: enable_request_logging, enable_response_logging,
+                    request_log_dir, response_log_dir
+    """
     config_path = os.path.join(os.path.dirname(__file__), "model_mapping.json")
+    
+    # 默认日志配置
+    default_logging = {
+        "enable_request_logging": True,
+        "enable_response_logging": True,
+        "request_log_dir": "request_logs",
+        "response_log_dir": "response_logs"
+    }
+    
     try:
         with open(config_path, "r", encoding="utf-8") as f:
             config = json.load(f)
@@ -290,22 +346,37 @@ def load_config():
                 # 新格式
                 model_mapping = config.get("model_mapping", {})
                 default_host = config.get("default_target_host", "api.openai.com")
+                logging_config = config.get("logging", default_logging)
             else:
                 # 旧格式（直接是模型映射）
                 model_mapping = config
                 default_host = "api.openai.com"
-            return model_mapping, default_host
+                logging_config = default_logging
+            
+            # 合并默认日志配置（确保所有字段都存在）
+            for key, value in default_logging.items():
+                if key not in logging_config:
+                    logging_config[key] = value
+            
+            return model_mapping, default_host, logging_config
         else:
-            return {}, "api.openai.com"
+            return {}, "api.openai.com", default_logging
     except FileNotFoundError:
         print(f"[Warning] model_mapping.json not found at {config_path}")
-        return {}, "api.openai.com"
+        return {}, "api.openai.com", default_logging
     except json.JSONDecodeError as e:
         print(f"[Warning] Failed to parse model_mapping.json: {e}")
-        return {}, "api.openai.com"
+        return {}, "api.openai.com", default_logging
 
-MODEL_MAPPING, DEFAULT_TARGET_HOST = load_config()
+# 加载配置并设置全局变量
+MODEL_MAPPING, DEFAULT_TARGET_HOST, LOGGING_CONFIG = load_config()
 DEFAULT_TARGET_BASE_URL = f"https://{DEFAULT_TARGET_HOST}"
+
+# 设置日志配置全局变量
+ENABLE_REQUEST_LOGGING = LOGGING_CONFIG.get("enable_request_logging", True)
+REQUEST_LOG_DIR = LOGGING_CONFIG.get("request_log_dir", "request_logs")
+ENABLE_RESPONSE_LOGGING = LOGGING_CONFIG.get("enable_response_logging", True)
+RESPONSE_LOG_DIR = LOGGING_CONFIG.get("response_log_dir", "response_logs")
 
 # 创建客户端缓存字典
 client_cache = {}
@@ -390,6 +461,9 @@ async def handle_chat_completions(request: Request, path: str, background_tasks:
         has_seen_condense_open = False
         has_seen_condense_close = False
         
+        # 收集所有原始响应用于保存日志
+        raw_chunks = []
+        
         # condense 标签检测函数
         def check_condense_tags(text: str) -> None:
             nonlocal has_seen_condense_open, has_seen_condense_close
@@ -417,7 +491,8 @@ async def handle_chat_completions(request: Request, path: str, background_tasks:
         
         # 如果是非流式请求处理
         if not hasattr(response, "__aiter__"):
-            full_res = response.model_dump_json()
+            response_dict = response.model_dump()
+            full_res = json.dumps(response_dict)
             print(f"\n[Response]: {full_res[:200]}...")
             
             # 拦截检查：非流式响应（仅检查 reasoning_content 和 content，排除代码块和 tool_calls）
@@ -467,11 +542,18 @@ async def handle_chat_completions(request: Request, path: str, background_tasks:
                     print(f"\033[31m[INTERCEPTED] No tool call detected in non-stream response but REQUIRE_NATIVE_TOOL_CALL is enabled!\033[0m")
                     raise InterceptionError("Native tool call is required but not found in response")
             
+            # 保存响应日志
+            background_tasks.add_task(save_response_log, response_dict, path, is_stream=False)
+            
             yield f"data: {full_res}\n\n"
             yield "data: [DONE]\n\n"
             return
 
         async for chunk in response:
+            # 保存原始 chunk 到列表用于日志记录
+            chunk_dict = chunk.model_dump()
+            raw_chunks.append(chunk_dict)
+            
             if chunk.choices and len(chunk.choices) > 0:
                 delta = chunk.choices[0].delta
                 
@@ -534,7 +616,7 @@ async def handle_chat_completions(request: Request, path: str, background_tasks:
                             # 注意：不对工具调用参数进行拦截检查（蓝色部分）
 
             # 保持原始格式透传
-            yield f"data: {chunk.model_dump_json()}\n\n"
+            yield f"data: {json.dumps(chunk_dict)}\n\n"
         
         # 流式响应结束后的检查（支持 condense 标签豁免）
         if REQUIRE_NATIVE_TOOL_CALL and not has_seen_tool_call:
@@ -542,6 +624,9 @@ async def handle_chat_completions(request: Request, path: str, background_tasks:
             if not (has_seen_condense_open and has_seen_condense_close):
                 print(f"\033[31m[INTERCEPTED] No tool call detected in stream response but REQUIRE_NATIVE_TOOL_CALL is enabled!\033[0m")
                 raise InterceptionError("Native tool call is required but not found in stream response")
+        
+        # 保存流式响应日志（原始内容）
+        background_tasks.add_task(save_response_log, raw_chunks, path, is_stream=True)
         
         print("\n[Stream Finished]")
         yield "data: [DONE]\n\n"

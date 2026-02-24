@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 >nul
-title Little Proxy - Port 8111
+title Little Proxy
 
 cd /d "%~dp0"
 

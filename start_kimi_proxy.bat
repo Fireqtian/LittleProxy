@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 >nul
-title Kimi Proxy - Port 8112
+title Kimi Proxy
 
 cd /d "%~dp0"
 
